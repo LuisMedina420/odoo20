@@ -1,7 +1,9 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -13,6 +15,44 @@ ADDONS_PATH = "/usr/lib/python3/dist-packages/odoo/addons,/mnt/extra-addons"
 
 def _conf_escape(value: str) -> str:
     return value.replace("%", "%%")
+
+
+class _ReusableHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+class _InitStatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta http-equiv='refresh' content='10'>"
+            "<title>Odoo 20 - Inicializando</title></head>"
+            "<body style='font-family:sans-serif;text-align:center;margin-top:60px;'>"
+            "<h2>Odoo 20 (Tienda UNICAH) se está inicializando en la nube...</h2>"
+            "<p>Instalando módulos y configurando la base de datos. Esta página se recargará automáticamente.</p>"
+            "</body></html>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_temp_http_server(port: int):
+    server = _ReusableHTTPServer(("0.0.0.0", port), _InitStatusHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[cloud-init] Servidor temporal de espera escuchando en 0.0.0.0:{port}", flush=True)
+    return server
 
 
 def get_db_config():
@@ -104,11 +144,14 @@ def check_db_status(db):
             cur.execute("SELECT to_regclass('public.ir_module_module');")
             has_modules_table = cur.fetchone()[0] is not None
             if not has_modules_table:
-                return False, False
+                return False, False, False
+            cur.execute("SELECT state FROM ir_module_module WHERE name = 'base';")
+            base_row = cur.fetchone()
+            base_installed = bool(base_row and base_row[0] == "installed")
             cur.execute("SELECT state FROM ir_module_module WHERE name = 'ventas_unicah';")
-            row = cur.fetchone()
-            ventas_installed = bool(row and row[0] == "installed")
-            return True, ventas_installed
+            ventas_row = cur.fetchone()
+            ventas_installed = bool(ventas_row and ventas_row[0] == "installed")
+            return True, base_installed, ventas_installed
     finally:
         conn.close()
 
@@ -116,6 +159,9 @@ def check_db_status(db):
 def bootstrap_users_and_demo_data(db_name: str, admin_password: str) -> None:
     setup_script = f"""
 admin_pw = {admin_password!r}
+
+# 0. Guardar adjuntos en PostgreSQL para evitar pérdida en disco efímero
+env["ir.config_parameter"].sudo().set_param("ir_attachment.location", "db")
 
 # 1. Actualizar contrasena del usuario admin principal
 admin_user = env.ref("base.user_admin", raise_if_not_found=False) or env["res.users"].search([("login", "=", "admin")], limit=1)
@@ -216,21 +262,21 @@ def main() -> None:
     write_odoo_conf(db, port, admin_password)
     wait_for_postgres(db)
 
-    has_modules_table, ventas_installed = check_db_status(db)
-    if not has_modules_table:
-        print(f"[cloud-init] Inicializando base de datos {db['name']} con base y ventas_unicah...", flush=True)
-        subprocess.run(
-            ["odoo", "-c", CONF_PATH, "-d", db["name"], "-i", "base,ventas_unicah", "--stop-after-init"],
-            check=True,
-        )
-        bootstrap_users_and_demo_data(db["name"], admin_password)
-    elif not ventas_installed:
-        print(f"[cloud-init] Instalando ventas_unicah en {db['name']}...", flush=True)
-        subprocess.run(
-            ["odoo", "-c", CONF_PATH, "-d", db["name"], "-i", "ventas_unicah", "--stop-after-init"],
-            check=True,
-        )
-        bootstrap_users_and_demo_data(db["name"], admin_password)
+    has_modules_table, base_installed, ventas_installed = check_db_status(db)
+    if not ventas_installed:
+        temp_server = start_temp_http_server(port)
+        try:
+            modules_to_init = "ventas_unicah" if (has_modules_table and base_installed) else "base,ventas_unicah"
+            print(f"[cloud-init] Inicializando base de datos {db['name']} con {modules_to_init}...", flush=True)
+            subprocess.run(
+                ["odoo", "-c", CONF_PATH, "-d", db["name"], "-i", modules_to_init, "--stop-after-init"],
+                check=True,
+            )
+            bootstrap_users_and_demo_data(db["name"], admin_password)
+        finally:
+            temp_server.shutdown()
+            temp_server.server_close()
+            time.sleep(1)
     else:
         print(f"[cloud-init] Base de datos {db['name']} ya inicializada con ventas_unicah.", flush=True)
 
